@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-RemoteStream 中继 — WebSocket + HTTP 轮询
-部署: Render / Railway 免费实例, 一键启动
+RemoteStream Relay v2 — WebSocket(PC) + SSE推送(手机)
+帧到达即推送, 无需轮询
 """
 
-import asyncio, json, os, signal, time, threading
-from datetime import datetime
-from urllib.parse import urlparse
+import asyncio, json, os, time, threading
+from aiohttp import web
 
 # ============================================================
-#  房间管理
-# ============================================================
-
 class Room:
     def __init__(self):
-        self.pc_ws = None       # PC WebSocket
-        self.phone_ws = None    # 手机 WebSocket (备用)
-        self.pc_pending: list[bytes] = []  # PC → Phone 待转发帧
-        self.phone_pending: list[bytes] = []  # Phone → PC 待转发音频
-        self.last_seen: dict[str, float] = {}  # role -> timestamp
+        self.pc_ws = None
+        self.phone_queue: asyncio.Queue | None = None  # SSE 推送队列
+        self.last_seen: dict[str, float] = {}
 
 rooms: dict[str, Room] = {}
 rooms_lock = threading.Lock()
@@ -29,78 +23,98 @@ def get_room(did: str) -> Room:
             rooms[did] = Room()
         return rooms[did]
 
-def cleanup_rooms():
-    """清理超过 5 分钟无活动的房间"""
+def cleanup():
     now = time.time()
     with rooms_lock:
-        stale = [did for did, r in rooms.items()
+        stale = [d for d, r in rooms.items()
                  if now - max(r.last_seen.values(), default=0) > 300]
-        for did in stale:
-            del rooms[did]
+        for d in stale: del rooms[d]
 
 # ============================================================
-#  HTTP + WebSocket 服务器
+#  WebSocket: PC 连接
 # ============================================================
-
-from aiohttp import web
-import aiohttp
 
 async def handle_ws(request):
-    """WebSocket: PC 客户端连接"""
     did = request.match_info.get("device_id", "")
     if not did or len(did) < 8:
-        return web.Response(status=400, text="bad device_id")
+        return web.Response(status=400, text="bad id")
 
     ws = web.WebSocketResponse(max_msg_size=256*1024)
     await ws.prepare(request)
 
     room = get_room(did)
-    role = "pc"
     room.pc_ws = ws
-    room.last_seen[role] = time.time()
+    room.last_seen["pc"] = time.time()
 
     try:
-        # 发送连接确认
-        await ws.send_str(json.dumps({"type": "connected", "role": role}))
-
-        # 处理消息
+        await ws.send_str(json.dumps({"type": "connected"}))
         async for msg in ws:
-            room.last_seen[role] = time.time()
-            if msg.type == aiohttp.WSMsgType.BINARY:
-                # PC 发来的加密帧, 缓存给手机
-                room.pc_pending.append(msg.data)
-                # 只保留最新一帧 (丢弃旧帧减少延迟)
-                if len(room.pc_pending) > 1:
-                    room.pc_pending = room.pc_pending[-1:]
-            elif msg.type == aiohttp.WSMsgType.TEXT:
-                pass  # 控制消息
+            room.last_seen["pc"] = time.time()
+            if msg.type == web.WSMsgType.BINARY:
+                # PC 发来的加密帧 → 立即推给手机 SSE
+                if room.phone_queue:
+                    await room.phone_queue.put(msg.data)
+            elif msg.type == web.WSMsgType.TEXT:
+                pass
     except Exception:
         pass
     finally:
         room.pc_ws = None
-
     return ws
 
-async def handle_http_poll(request):
-    """HTTP 轮询: 手机获取摄像头帧"""
+# ============================================================
+#  SSE: 手机推送流 (替代轮询)
+# ============================================================
+
+async def handle_sse(request):
+    """Server-Sent Events — 帧到达即推送"""
     did = request.match_info.get("device_id", "")
+    if not did or len(did) < 8:
+        return web.Response(status=400)
+
     room = get_room(did)
+    room.phone_queue = asyncio.Queue(maxsize=8)
     room.last_seen["phone"] = time.time()
 
-    # 等待新帧 (最多 1.5 秒, 避免阻塞过久)
-    waited = 0
-    while not room.pc_pending and waited < 15:
-        await asyncio.sleep(0.1)
-        waited += 1
+    resp = web.StreamResponse()
+    resp.headers["Content-Type"] = "text/event-stream"
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Connection"] = "keep-alive"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    await resp.prepare(request)
 
-    if room.pc_pending:
-        data = room.pc_pending.pop(0)
-        return web.Response(body=data, content_type="application/octet-stream")
-    else:
-        return web.Response(status=204)  # No Content
+    try:
+        # 发送初始连接确认
+        await resp.write(b"event: connected\ndata: ok\n\n")
 
-async def handle_http_send(request):
-    """HTTP POST: 手机发送加密音频"""
+        while True:
+            data = await asyncio.wait_for(room.phone_queue.get(), timeout=30)
+            room.last_seen["phone"] = time.time()
+
+            # SSE 格式: 二进制帧用 base64 编码
+            import base64 as b64
+            encoded = b64.b64encode(data).decode()
+            # 分块发送 (每块最多 64KB, 防止 SSE 行过长)
+            chunk_size = 48000  # 64KB base64 ≈ 48K chars
+            for i in range(0, len(encoded), chunk_size):
+                chunk = encoded[i:i+chunk_size]
+                msg = f"data: {chunk}\n\n"
+                await resp.write(msg.encode())
+
+            # 帧结束标记
+            await resp.write(b"event: frame_end\ndata: \n\n")
+    except (asyncio.TimeoutError, ConnectionResetError, Exception):
+        pass
+    finally:
+        room.phone_queue = None
+
+    return resp
+
+# ============================================================
+#  HTTP POST: 手机发送加密音频
+# ============================================================
+
+async def handle_send(request):
     did = request.match_info.get("device_id", "")
     room = get_room(did)
     room.last_seen["phone"] = time.time()
@@ -111,33 +125,30 @@ async def handle_http_send(request):
     return web.Response(text="ok")
 
 async def handle_status(request):
-    """状态查询"""
     did = request.match_info.get("device_id", "")
     room = get_room(did)
     return web.json_response({
         "pc_connected": room.pc_ws is not None and not room.pc_ws.closed,
-        "frames_pending": len(room.pc_pending)
+        "phone_connected": room.phone_queue is not None
     })
 
 async def index(request):
-    return web.json_response({"service": "RemoteStream Relay", "rooms": len(rooms)})
+    return web.json_response({"service": "RemoteStream Relay v2"})
 
-# ============================================================
-#  启动
 # ============================================================
 
 async def periodic_cleanup():
     while True:
         await asyncio.sleep(60)
-        cleanup_rooms()
+        cleanup()
 
 async def main():
     port = int(os.environ.get("PORT", 10000))
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws/{device_id}", handle_ws)
-    app.router.add_get("/poll/{device_id}/camera", handle_http_poll)
-    app.router.add_post("/send/{device_id}/audio", handle_http_send)
+    app.router.add_get("/stream/{device_id}/camera", handle_sse)
+    app.router.add_post("/send/{device_id}/audio", handle_send)
     app.router.add_get("/status/{device_id}", handle_status)
 
     asyncio.create_task(periodic_cleanup())
@@ -146,7 +157,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Relay running on port {port}")
+    print(f"Relay v2 on :{port}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
