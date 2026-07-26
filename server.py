@@ -69,9 +69,9 @@ async def handle_ws(request):
             if msg.type == aiohttp.WSMsgType.BINARY:
                 # PC 发来的加密帧, 缓存给手机
                 room.pc_pending.append(msg.data)
-                # 只保留最新一帧
-                if len(room.pc_pending) > 3:
-                    room.pc_pending = room.pc_pending[-3:]
+                # 只保留最新一帧 (丢弃旧帧减少延迟)
+                if len(room.pc_pending) > 1:
+                    room.pc_pending = room.pc_pending[-1:]
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 pass  # 控制消息
     except Exception:
@@ -87,9 +87,9 @@ async def handle_http_poll(request):
     room = get_room(did)
     room.last_seen["phone"] = time.time()
 
-    # 等待新帧 (最多 5 秒)
+    # 等待新帧 (最多 1.5 秒, 避免阻塞过久)
     waited = 0
-    while not room.pc_pending and waited < 50:
+    while not room.pc_pending and waited < 15:
         await asyncio.sleep(0.1)
         waited += 1
 
