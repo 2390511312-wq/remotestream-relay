@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-RemoteStream Relay v2 — WebSocket(PC) + SSE推送(手机)
-帧到达即推送, 无需轮询
+RemoteStream Relay v3 — WebSocket(PC) + 批量轮询(手机)
+Render 免费实例长连接不稳定, 使用短 HTTP 批量拉帧
 """
 
-import asyncio, json, os, time, threading
+import asyncio, json, os, time, threading, base64, struct
+from collections import deque
 from aiohttp import web
 
 # ============================================================
 class Room:
     def __init__(self):
         self.pc_ws = None
-        self.phone_queue: asyncio.Queue | None = None  # SSE 推送队列
+        self.frames: deque = deque(maxlen=10)  # 最多缓存10帧
         self.last_seen: dict[str, float] = {}
 
 rooms: dict[str, Room] = {}
@@ -31,17 +32,16 @@ def cleanup():
         for d in stale: del rooms[d]
 
 # ============================================================
-#  WebSocket: PC 连接
+#  WebSocket: PC
 # ============================================================
 
 async def handle_ws(request):
     did = request.match_info.get("device_id", "")
     if not did or len(did) < 8:
-        return web.Response(status=400, text="bad id")
+        return web.Response(status=400)
 
     ws = web.WebSocketResponse(max_msg_size=256*1024)
     await ws.prepare(request)
-
     room = get_room(did)
     room.pc_ws = ws
     room.last_seen["pc"] = time.time()
@@ -51,11 +51,7 @@ async def handle_ws(request):
         async for msg in ws:
             room.last_seen["pc"] = time.time()
             if msg.type == web.WSMsgType.BINARY:
-                # PC 发来的加密帧 → 立即推给手机 SSE
-                if room.phone_queue:
-                    await room.phone_queue.put(msg.data)
-            elif msg.type == web.WSMsgType.TEXT:
-                pass
+                room.frames.append(msg.data)
     except Exception:
         pass
     finally:
@@ -63,62 +59,43 @@ async def handle_ws(request):
     return ws
 
 # ============================================================
-#  SSE: 手机推送流 (替代轮询)
+#  批量轮询: 手机 (替代 SSE)
 # ============================================================
 
-async def handle_sse(request):
-    """Server-Sent Events — 帧到达即推送"""
+async def handle_poll(request):
+    """返回所有缓存帧, 用长度前缀打包"""
     did = request.match_info.get("device_id", "")
-    if not did or len(did) < 8:
-        return web.Response(status=400)
-
     room = get_room(did)
-    room.phone_queue = asyncio.Queue(maxsize=8)
     room.last_seen["phone"] = time.time()
 
-    resp = web.StreamResponse()
-    resp.headers["Content-Type"] = "text/event-stream"
-    resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["Connection"] = "keep-alive"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    await resp.prepare(request)
+    if not room.frames:
+        # 等最多 600ms, 有新帧立即返回
+        await asyncio.sleep(0.6)
 
-    try:
-        # 发送初始连接确认
-        await resp.write(b"event: connected\ndata: ok\n\n")
+    frames = []
+    while room.frames:
+        frames.append(room.frames.popleft())
 
-        while True:
-            data = await asyncio.wait_for(room.phone_queue.get(), timeout=30)
-            room.last_seen["phone"] = time.time()
+    if not frames:
+        return web.Response(status=204)
 
-            # SSE 格式: 二进制帧用 base64 编码
-            import base64 as b64
-            encoded = b64.b64encode(data).decode()
-            # 分块发送 (每块最多 64KB, 防止 SSE 行过长)
-            chunk_size = 48000  # 64KB base64 ≈ 48K chars
-            for i in range(0, len(encoded), chunk_size):
-                chunk = encoded[i:i+chunk_size]
-                msg = f"data: {chunk}\n\n"
-                await resp.write(msg.encode())
+    # 打包: [4字节帧数][每帧: 4字节长度+数据]
+    buf = bytearray()
+    buf.extend(struct.pack(">I", len(frames)))
+    for f in frames:
+        buf.extend(struct.pack(">I", len(f)))
+        buf.extend(f)
 
-            # 帧结束标记
-            await resp.write(b"event: frame_end\ndata: \n\n")
-    except (asyncio.TimeoutError, ConnectionResetError, Exception):
-        pass
-    finally:
-        room.phone_queue = None
-
-    return resp
+    return web.Response(body=bytes(buf), content_type="application/octet-stream")
 
 # ============================================================
-#  HTTP POST: 手机发送加密音频
+#  HTTP POST: 手机音频
 # ============================================================
 
 async def handle_send(request):
     did = request.match_info.get("device_id", "")
     room = get_room(did)
     room.last_seen["phone"] = time.time()
-
     data = await request.read()
     if room.pc_ws and not room.pc_ws.closed:
         await room.pc_ws.send_bytes(data)
@@ -129,11 +106,11 @@ async def handle_status(request):
     room = get_room(did)
     return web.json_response({
         "pc_connected": room.pc_ws is not None and not room.pc_ws.closed,
-        "phone_connected": room.phone_queue is not None
+        "frames_queued": len(room.frames)
     })
 
 async def index(request):
-    return web.json_response({"service": "RemoteStream Relay v2"})
+    return web.json_response({"service": "RemoteStream Relay v3"})
 
 # ============================================================
 
@@ -147,17 +124,15 @@ async def main():
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/ws/{device_id}", handle_ws)
-    app.router.add_get("/stream/{device_id}/camera", handle_sse)
+    app.router.add_get("/poll/{device_id}/camera", handle_poll)
     app.router.add_post("/send/{device_id}/audio", handle_send)
     app.router.add_get("/status/{device_id}", handle_status)
-
     asyncio.create_task(periodic_cleanup())
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Relay v2 on :{port}")
+    print(f"Relay v3 on :{port}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
