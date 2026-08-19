@@ -104,9 +104,12 @@ async def handle_send(request):
 async def handle_status(request):
     did = request.match_info.get("device_id", "")
     room = get_room(did)
+    now = time.time()
+    phone_online = now - room.last_seen.get("phone", 0) < 5  # 5秒内轮询视为在线
     return web.json_response({
         "pc_connected": room.pc_ws is not None and not room.pc_ws.closed,
-        "frames_queued": len(room.frames)
+        "frames_queued": len(room.frames),
+        "phone_online": phone_online
     })
 
 async def index(request):
