@@ -14,7 +14,8 @@ class Room:
         self.pc_ws = None
         self.frames: deque = deque(maxlen=10)  # 最多缓存10帧
         self.last_seen: dict[str, float] = {}
-        self.mode: str = 'camera'  # camera / screen / parallel
+        self.mode: str = 'camera'  # camera / screen / parallel / bandwidth
+        self.ratio: float = 0.5    # 带宽比例（bandwidth 模式，0~1）
 
 rooms: dict[str, Room] = {}
 rooms_lock = threading.Lock()
@@ -111,25 +112,29 @@ async def handle_status(request):
         "pc_connected": room.pc_ws is not None and not room.pc_ws.closed,
         "frames_queued": len(room.frames),
         "phone_online": phone_online,
-        "mode": room.mode
+        "mode": room.mode,
+        "ratio": room.ratio
     })
 
 async def handle_mode(request):
-    """POST 设置视频模式，GET 查询"""
+    """POST 设置视频模式（含 bandwidth 的 ratio），GET 查询"""
     did = request.match_info.get("device_id", "")
     room = get_room(did)
     if request.method == "POST":
         try:
             data = await request.json()
             mode = data.get("mode", "camera")
-            if mode in ('camera', 'screen', 'parallel'):
+            if mode in ('camera', 'screen', 'parallel', 'bandwidth'):
                 room.mode = mode
-                return web.json_response({"success": True, "mode": mode})
+                # bandwidth 模式支持 ratio（0~1）
+                ratio = data.get("ratio", room.ratio)
+                room.ratio = max(0.0, min(1.0, float(ratio)))
+                return web.json_response({"success": True, "mode": mode, "ratio": room.ratio})
         except Exception:
             pass
         return web.json_response({"success": False}, status=400)
     else:
-        return web.json_response({"mode": room.mode})
+        return web.json_response({"mode": room.mode, "ratio": room.ratio})
 
 async def index(request):
     return web.json_response({"service": "RemoteStream Relay v3"})
