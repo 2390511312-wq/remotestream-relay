@@ -21,6 +21,7 @@ class Room:
         self.ratio: float = 0.5
         self.auth_token: str = ''
         self.streams: set = set()               # 每台手机一个 asyncio.Queue
+        self.stream_sent: int = 0               # 已成功写入手机连接的帧数（诊断用）
 
 rooms: dict[str, Room] = {}
 rooms_lock = threading.Lock()
@@ -136,6 +137,7 @@ async def handle_stream(request):
                 data = await asyncio.wait_for(q.get(), timeout=10)
                 room.last_seen["phone"] = time.time()
                 await resp.write(struct.pack(">I", len(data)) + data)
+                room.stream_sent += 1
             except asyncio.TimeoutError:
                 # 心跳：长度为 0 的帧，手机端忽略
                 await resp.write(struct.pack(">I", 0))
@@ -200,6 +202,7 @@ async def handle_status(request):
         "frames_queued": len(room.frames),
         "phone_online": phone_online,
         "phones": len(room.streams),
+        "stream_sent": room.stream_sent,
         "mode": room.mode,
         "ratio": room.ratio
     })
